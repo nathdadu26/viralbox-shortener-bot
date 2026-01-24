@@ -1,0 +1,5 @@
+python-dotenv==1.0.0
+requests==2.31.0
+pymongo==4.6.1
+certifi==2024.2.2
+urllib3==2.2.1
