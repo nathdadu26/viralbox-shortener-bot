@@ -192,9 +192,6 @@ def process_message(msg):
                 send_message(chat_id, "❌ Please send a valid link.")
                 return
 
-            # Send processing message
-            processing_msg = send_message(chat_id, "⏳ Shortening your link...")
-
             short = shorten_url(url)
             if not short:
                 send_message(chat_id, "❌ URL shortener failed. Please try again.")
