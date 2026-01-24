@@ -1,14 +1,12 @@
-# shortener.py (Webhook Mode - Final Version)
-
 import os
 import json
-from urllib.parse import urlparse
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from threading import Thread
 import requests
+import re
 
 load_dotenv()
 
@@ -122,40 +120,13 @@ def setup_webhook():
         
         if response.json().get("ok"):
             print(f"✅ Webhook set: {webhook_url}")
-            
-            commands = [
-                {"command": "start", "description": "Start the bot"},
-                {"command": "myid", "description": "Get your User ID"},
-                {"command": "status", "description": "Bot status"}
-            ]
-            requests.post(f"{TELEGRAM_API}/setMyCommands", json={"commands": commands})
-            print("✅ Commands set")
-            
-            send_startup_notification()
+            print(f"👥 Admins: {len(ADMIN_IDS)}")
+            print(f"🌐 Webhook mode - Platform friendly!")
         else:
             print(f"❌ Webhook failed: {response.text}")
             
     except Exception as e:
         print(f"❌ Webhook error: {e}")
-
-
-def send_startup_notification():
-    try:
-        for admin_id in ADMIN_IDS:
-            message = (
-                "🚀 *Bot Restarted!*\n\n"
-                f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                f"👥 Admins: {len(ADMIN_IDS)}\n"
-                f"🌐 Mode: Webhook\n\n"
-                "Ready to shorten links! 🔗"
-            )
-            requests.post(
-                f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": admin_id, "text": message, "parse_mode": "Markdown"}
-            )
-        print(f"✅ Notified {len(ADMIN_IDS)} admin(s)")
-    except Exception as e:
-        print(f"⚠️  Notification failed: {e}")
 
 
 # Admin Check
@@ -188,12 +159,11 @@ def save_to_db(longURL, shortURL):
         print(f"DB error: {e}")
 
 
-def extract_url(text):
+def extract_urls(text):
     if not text:
-        return None
-    import re
-    m = re.search(r"(https?://[^\s]+)", text)
-    return m.group(0) if m else None
+        return []
+    urls = re.findall(r'(https?://[^\s]+)', text)
+    return urls
 
 
 def send_message(chat_id, text):
@@ -218,7 +188,6 @@ def resend_media(chat_id, type, file_id, caption):
     }.get(type)
 
     if not endpoint:
-        send_message(chat_id, caption)
         return
 
     try:
@@ -237,15 +206,12 @@ def process_message(msg):
         username = msg["from"].get("username", "Unknown")
         first_name = msg["from"].get("first_name", "User")
 
+        # Only admins can use the bot - silently ignore others
         if not is_admin(user_id):
             print(f"⛔ Unauthorized: {username} ({user_id})")
-            send_message(
-                chat_id,
-                f"❌ *Access Denied!*\n\nYour ID: `{user_id}`\nContact bot owner."
-            )
             return
 
-        # /start
+        # /start command
         if msg.get("text", "").startswith("/start"):
             send_message(
                 chat_id,
@@ -256,47 +222,35 @@ def process_message(msg):
             )
             return
 
-        # /myid
-        if msg.get("text", "").startswith("/myid"):
-            send_message(chat_id, f"Your ID: `{user_id}`")
-            return
-
-        # /status
-        if msg.get("text", "").startswith("/status"):
-            global total_requests
-            uptime = (datetime.utcnow() - bot_start_time).total_seconds()
-            h = int(uptime // 3600)
-            m = int((uptime % 3600) // 60)
-            
-            send_message(
-                chat_id,
-                f"📊 *Status*\n\n"
-                f"✅ Online (Webhook)\n"
-                f"⏰ Uptime: {h}h {m}m\n"
-                f"👥 Admins: {len(ADMIN_IDS)}\n"
-                f"📨 Requests: {total_requests}\n"
-                f"📅 Last: {last_activity.strftime('%H:%M:%S')}"
-            )
-            return
-
-        # Text URL
+        # Text URL processing
         if msg.get("text"):
-            url = extract_url(msg["text"])
-            if not url:
-                send_message(chat_id, "❌ Send a valid link.")
+            urls = extract_urls(msg["text"])
+            if not urls:
                 return
 
-            short = shorten_url(url)
-            if not short:
-                send_message(chat_id, "❌ Shortening failed.")
+            shortened_links = []
+            for url in urls:
+                short = shorten_url(url)
+                if short:
+                    save_to_db(url, short)
+                    shortened_links.append(short)
+                    print(f"✅ {username} (text): {short}")
+
+            if not shortened_links:
                 return
 
-            save_to_db(url, short)
-            send_message(chat_id, f"✅ *Shortened:*\n\n{short}")
-            print(f"✅ {username}: {short}")
+            # Build response with formatted links
+            response_parts = []
+            for short_link in shortened_links:
+                response_parts.append(f"✅ Video Link 👇\n{short_link}\n")
+            
+            response_parts.append("Join Backup channel ✅\n➤  https://t.me/+oI8Y9HQJV1A4ZDg1")
+            
+            final_response = "\n".join(response_parts)
+            send_message(chat_id, final_response)
             return
 
-        # Media URL
+        # Media with caption
         media_types = ["photo", "video", "document", "audio", "voice", "animation"]
         media_type = None
         file_id = None
@@ -308,19 +262,30 @@ def process_message(msg):
                 break
 
         if media_type:
-            url = extract_url(msg.get("caption", ""))
-            if not url:
-                send_message(chat_id, "❌ Add URL in caption.")
+            urls = extract_urls(msg.get("caption", ""))
+            if not urls:
                 return
 
-            short = shorten_url(url)
-            if not short:
-                send_message(chat_id, "❌ Failed.")
+            shortened_links = []
+            for url in urls:
+                short = shorten_url(url)
+                if short:
+                    save_to_db(url, short)
+                    shortened_links.append(short)
+                    print(f"✅ {username} (media): {short}")
+
+            if not shortened_links:
                 return
 
-            save_to_db(url, short)
-            resend_media(chat_id, media_type, file_id, f"✅ *Short:*\n\n{short}")
-            print(f"✅ {username} (media): {short}")
+            # Build caption with formatted links
+            caption_parts = []
+            for short_link in shortened_links:
+                caption_parts.append(f"✅ Video Link 👇\n{short_link}\n")
+            
+            caption_parts.append("Join Backup channel ✅\n➤  https://t.me/+oI8Y9HQJV1A4ZDg1")
+            
+            final_caption = "\n".join(caption_parts)
+            resend_media(chat_id, media_type, file_id, final_caption)
             return
 
     except Exception as e:
@@ -331,8 +296,6 @@ def process_message(msg):
 def run_server():
     server = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
     print(f"🤖 Webhook server running on port {PORT}")
-    print(f"👥 Admins: {ADMIN_IDS}")
-    print(f"🌐 Webhook mode - Platform friendly!")
     server.serve_forever()
 
 
