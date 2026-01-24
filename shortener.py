@@ -1,16 +1,15 @@
-# shortener.py (Admin-Only Concurrent Version with Health Check)
-# Only authorized admins can use this bot
+# shortener.py (Webhook Mode - Platform Friendly)
+# No polling, no self-ping, no abuse!
 
 import os
-import time
-import requests
+import json
 from urllib.parse import urlparse
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from datetime import datetime
-from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
+import requests
 
 load_dotenv()
 
@@ -20,10 +19,10 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 MONGODB_URI = os.getenv("MONGODB_URI")
 DB_NAME = os.getenv("MONGO_DB_NAME", "viralbox_db")
-HEALTH_CHECK_PORT = int(os.getenv("PORT", "8000"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+PORT = int(os.getenv("PORT", "8000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")  # Your Koyeb URL
 
-# Admin User IDs (comma-separated in .env)
+# Admin User IDs
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = set([int(id.strip()) for id in ADMIN_IDS_STR.split(",") if id.strip()])
 
@@ -33,52 +32,155 @@ if not BOT_TOKEN or not MONGODB_URI or not API_KEY:
 if not ADMIN_IDS:
     raise RuntimeError("ADMIN_IDS must be set in .env")
 
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL must be set in .env")
+
 # ------------------ DB SETUP ------------------ #
 client = MongoClient(MONGODB_URI, maxPoolSize=50)
 db = client[DB_NAME]
 links_col = db["links"]
 
+# ------------------ STATS ------------------ #
+bot_start_time = datetime.utcnow()
+total_requests = 0
+last_activity = datetime.utcnow()
 
-# ------------------ HEALTH CHECK SERVER ------------------ #
-class HealthCheckHandler(BaseHTTPRequestHandler):
+
+# ------------------ WEBHOOK HANDLER ------------------ #
+class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        global total_requests, last_activity
+        
         if self.path == '/health' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
+            
+            uptime = (datetime.utcnow() - bot_start_time).total_seconds()
             response = {
                 "status": "healthy",
-                "bot": "shortener-admin",
+                "bot": "shortener-webhook",
+                "mode": "webhook",
                 "timestamp": datetime.utcnow().isoformat(),
-                "workers": MAX_WORKERS,
-                "admins": len(ADMIN_IDS)
+                "uptime_seconds": int(uptime),
+                "admins": len(ADMIN_IDS),
+                "total_requests": total_requests,
+                "last_activity": last_activity.isoformat()
             }
-            self.wfile.write(str(response).encode())
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        global total_requests, last_activity
+        
+        if self.path == f'/{BOT_TOKEN}':
+            # Webhook endpoint
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            try:
+                update = json.loads(post_data.decode('utf-8'))
+                
+                # Process in background thread
+                if "message" in update:
+                    total_requests += 1
+                    last_activity = datetime.utcnow()
+                    Thread(target=process_message, args=(update["message"],)).start()
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"ok": true}')
+                
+            except Exception as e:
+                print(f"Error processing webhook: {e}")
+                self.send_response(500)
+                self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass
+        # Only log errors
+        if "error" in format.lower():
+            print(format % args)
 
 
-def start_health_server():
-    server = HTTPServer(('0.0.0.0', HEALTH_CHECK_PORT), HealthCheckHandler)
-    print(f"✅ Health check server running on port {HEALTH_CHECK_PORT}")
-    server.serve_forever()
+# ------------------ WEBHOOK SETUP ------------------ #
+def setup_webhook():
+    """Set webhook on Telegram"""
+    webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    
+    try:
+        # Delete existing webhook first
+        requests.post(f"{TELEGRAM_API}/deleteWebhook")
+        print("🗑️  Deleted old webhook")
+        
+        # Set new webhook
+        response = requests.post(
+            f"{TELEGRAM_API}/setWebhook",
+            json={
+                "url": webhook_url,
+                "max_connections": 100,
+                "allowed_updates": ["message"]
+            }
+        )
+        
+        if response.json().get("ok"):
+            print(f"✅ Webhook set successfully: {webhook_url}")
+            
+            # Set bot commands
+            commands = [
+                {"command": "start", "description": "Start the bot"},
+                {"command": "myid", "description": "Get your User ID"},
+                {"command": "status", "description": "Check bot status"}
+            ]
+            requests.post(f"{TELEGRAM_API}/setMyCommands", json={"commands": commands})
+            print("✅ Bot commands set")
+            
+            # Send notification to admins
+            send_startup_notification()
+            
+        else:
+            print(f"❌ Webhook setup failed: {response.text}")
+            
+    except Exception as e:
+        print(f"❌ Error setting webhook: {e}")
+
+
+def send_startup_notification():
+    """Send startup notification to admins"""
+    try:
+        for admin_id in ADMIN_IDS:
+            message = (
+                "🚀 *Bot Restarted Successfully!*\n\n"
+                f"⏰ Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                f"👥 Authorized Admins: {len(ADMIN_IDS)}\n"
+                f"🌐 Mode: Webhook (Platform Friendly)\n\n"
+                "Bot is ready! Send any link to shorten. 🔗"
+            )
+            requests.post(
+                f"{TELEGRAM_API}/sendMessage",
+                json={
+                    "chat_id": admin_id,
+                    "text": message,
+                    "parse_mode": "Markdown"
+                }
+            )
+        print(f"✅ Startup notification sent to {len(ADMIN_IDS)} admin(s)")
+    except Exception as e:
+        print(f"⚠️  Failed to send notification: {e}")
 
 
 # ------------------ ADMIN CHECK ------------------ #
-
 def is_admin(user_id):
-    """Check if user is admin"""
     return user_id in ADMIN_IDS
 
 
 # ------------------ HELPERS ------------------ #
-
 def shorten_url(longURL):
-    """Shorten URL using ViralBox API"""
     try:
         api = f"https://viralbox.in/api?api={API_KEY}&url={requests.utils.requote_uri(longURL)}"
         r = requests.get(api, timeout=15)
@@ -92,7 +194,6 @@ def shorten_url(longURL):
 
 
 def save_to_db(longURL, shortURL):
-    """Save link to database"""
     try:
         links_col.insert_one({
             "longURL": longURL,
@@ -104,7 +205,6 @@ def save_to_db(longURL, shortURL):
 
 
 def extract_url(text):
-    """Extract URL from text"""
     if not text:
         return None
     import re
@@ -113,11 +213,10 @@ def extract_url(text):
 
 
 def send_message(chat_id, text):
-    """Send text message"""
     try:
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
             timeout=10
         )
     except Exception as e:
@@ -125,7 +224,6 @@ def send_message(chat_id, text):
 
 
 def resend_media(chat_id, type, file_id, caption):
-    """Resend media with caption"""
     endpoint = {
         "photo": "sendPhoto",
         "video": "sendVideo",
@@ -140,7 +238,7 @@ def resend_media(chat_id, type, file_id, caption):
         return
 
     try:
-        payload = {"chat_id": chat_id, "caption": caption}
+        payload = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
         payload[type] = file_id
         requests.post(f"{TELEGRAM_API}/{endpoint}", json=payload, timeout=10)
     except Exception as e:
@@ -148,24 +246,21 @@ def resend_media(chat_id, type, file_id, caption):
 
 
 # ------------------ PROCESS MESSAGE ------------------ #
-
 def process_message(msg):
-    """Process a single message (runs in thread pool)"""
     try:
         chat_id = msg["chat"]["id"]
         user_id = msg["from"]["id"]
         username = msg["from"].get("username", "Unknown")
         first_name = msg["from"].get("first_name", "User")
 
-        # --- ADMIN CHECK (CRITICAL) ---
+        # --- ADMIN CHECK ---
         if not is_admin(user_id):
-            print(f"⛔ Unauthorized access attempt by {username} (ID: {user_id})")
+            print(f"⛔ Unauthorized: {username} (ID: {user_id})")
             send_message(
                 chat_id,
-                "❌ Access Denied!\n\n"
-                "⚠️ This bot is for authorized admins only.\n"
-                f"Your User ID: `{user_id}`\n\n"
-                "Contact the bot owner to get access."
+                "❌ *Access Denied!*\n\n"
+                f"Your ID: `{user_id}`\n"
+                "Contact bot owner for access."
             )
             return
 
@@ -173,10 +268,10 @@ def process_message(msg):
         if msg.get("text", "").startswith("/start"):
             send_message(
                 chat_id,
-                f"👋 Welcome Admin {first_name}!\n\n"
-                f"🔗 Send me any link to shorten.\n"
-                f"📷 You can also send media with URL in caption.\n\n"
-                f"Your User ID: `{user_id}`"
+                f"👋 *Welcome {first_name}!*\n\n"
+                f"🔗 Send any link to shorten.\n"
+                f"📷 Or send media with URL in caption.\n\n"
+                f"Your ID: `{user_id}`"
             )
             return
 
@@ -185,21 +280,39 @@ def process_message(msg):
             send_message(chat_id, f"Your User ID: `{user_id}`")
             return
 
+        # --- /status ---
+        if msg.get("text", "").startswith("/status"):
+            global total_requests
+            uptime = (datetime.utcnow() - bot_start_time).total_seconds()
+            hours = int(uptime // 3600)
+            minutes = int((uptime % 3600) // 60)
+            
+            status_msg = (
+                f"📊 *Bot Status*\n\n"
+                f"✅ Status: Online (Webhook)\n"
+                f"⏰ Uptime: {hours}h {minutes}m\n"
+                f"👥 Admins: {len(ADMIN_IDS)}\n"
+                f"📨 Total Requests: {total_requests}\n"
+                f"📅 Last Activity: {last_activity.strftime('%H:%M:%S')}"
+            )
+            send_message(chat_id, status_msg)
+            return
+
         # --- TEXT URL ---
         if msg.get("text"):
             url = extract_url(msg["text"])
             if not url:
-                send_message(chat_id, "❌ Please send a valid link.")
+                send_message(chat_id, "❌ Send a valid link.")
                 return
 
             short = shorten_url(url)
             if not short:
-                send_message(chat_id, "❌ URL shortener failed. Please try again.")
+                send_message(chat_id, "❌ Shortening failed.")
                 return
 
             save_to_db(url, short)
-            send_message(chat_id, f"✅ Shortened URL:\n\n{short}")
-            print(f"✅ Link shortened by {username} (ID: {user_id})")
+            send_message(chat_id, f"✅ *Shortened:*\n\n{short}")
+            print(f"✅ {username}: {url} → {short}")
             return
 
         # --- MEDIA URL ---
@@ -210,69 +323,42 @@ def process_message(msg):
         for t in media_types:
             if msg.get(t):
                 media_type = t
-                if t == "photo":
-                    file_id = msg["photo"][-1]["file_id"]
-                else:
-                    file_id = msg[t]["file_id"]
+                file_id = msg["photo"][-1]["file_id"] if t == "photo" else msg[t]["file_id"]
                 break
 
         if media_type:
             url = extract_url(msg.get("caption", ""))
             if not url:
-                send_message(chat_id, "❌ Caption me valid link send kare.")
+                send_message(chat_id, "❌ Add URL in caption.")
                 return
 
             short = shorten_url(url)
             if not short:
-                send_message(chat_id, "❌ Shortener failed.")
+                send_message(chat_id, "❌ Failed.")
                 return
 
             save_to_db(url, short)
-            resend_media(chat_id, media_type, file_id, f"✅ Short Link:\n\n{short}")
-            print(f"✅ Media link shortened by {username} (ID: {user_id})")
+            resend_media(chat_id, media_type, file_id, f"✅ *Short:*\n\n{short}")
+            print(f"✅ {username} (media): {url} → {short}")
             return
 
     except Exception as e:
-        print(f"Error processing message: {e}")
-        try:
-            send_message(msg["chat"]["id"], "❌ An error occurred. Please try again.")
-        except:
-            pass
+        print(f"Error: {e}")
 
 
-# ------------------ BOT POLLING LOOP (CONCURRENT) ------------------ #
-
-def polling_loop():
-    print(f"🤖 Admin-Only Shortener Bot Running")
-    print(f"👥 Authorized Admins: {len(ADMIN_IDS)}")
-    print(f"⚡ Concurrent Workers: {MAX_WORKERS}")
-    print(f"🔐 Admin IDs: {ADMIN_IDS}")
-    offset = None
-    
-    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-    while True:
-        try:
-            r = requests.get(
-                f"{TELEGRAM_API}/getUpdates",
-                params={"timeout": 50, "offset": offset},
-                timeout=60
-            ).json()
-
-            for upd in r.get("result", []):
-                offset = upd["update_id"] + 1
-                if "message" in upd:
-                    executor.submit(process_message, upd["message"])
-
-        except Exception as e:
-            print("Polling Error:", e)
-            time.sleep(2)
+# ------------------ START SERVER ------------------ #
+def run_server():
+    server = HTTPServer(('0.0.0.0', PORT), WebhookHandler)
+    print(f"🤖 Webhook server running on port {PORT}")
+    print(f"👥 Admins: {ADMIN_IDS}")
+    print(f"🌐 Webhook mode - No polling, platform friendly!")
+    server.serve_forever()
 
 
-# ------------------ START BOT ------------------ #
-
+# ------------------ MAIN ------------------ #
 if __name__ == "__main__":
-    health_thread = Thread(target=start_health_server, daemon=True)
-    health_thread.start()
+    # Setup webhook
+    setup_webhook()
     
-    polling_loop()
+    # Start server
+    run_server()
