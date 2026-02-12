@@ -244,7 +244,7 @@ def process_message(msg):
             for short_link in shortened_links:
                 response_parts.append(f"✅ Video Link 👇\n{short_link}\n")
             
-            response_parts.append("Join Backup channel ✅\n➤  https://t.me/+oI8Y9HQJV1A4ZDg1")
+            response_parts.append("Join Backup channel ✅\n➤  https://t.me/+s1UUnoka8CdhYWVl")
             
             final_response = "\n".join(response_parts)
             send_message(chat_id, final_response)
@@ -282,7 +282,7 @@ def process_message(msg):
             for short_link in shortened_links:
                 caption_parts.append(f"✅ Video Link 👇\n{short_link}\n")
             
-            caption_parts.append("Join Backup channel ✅\n➤  https://t.me/+oI8Y9HQJV1A4ZDg1")
+            caption_parts.append("Join Backup channel ✅\n➤  https://t.me/+s1UUnoka8CdhYWVl")
             
             final_caption = "\n".join(caption_parts)
             resend_media(chat_id, media_type, file_id, final_caption)
