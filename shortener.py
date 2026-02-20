@@ -24,6 +24,9 @@ if not BOT_TOKEN or not MONGODB_URI:
 if not WEBHOOK_URL:
     raise RuntimeError("WEBHOOK_URL must be set")
 
+# Self-ping interval (seconds) — keeps bot alive on Koyeb free tier
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", "840"))  # 14 min default
+
 # DB Setup
 client = MongoClient(MONGODB_URI, maxPoolSize=50)
 db = client[DB_NAME]
@@ -495,6 +498,29 @@ def process_message(msg):
 
 
 # ─────────────────────────────────────────────
+# Self-Ping (keeps bot alive on free tier)
+# ─────────────────────────────────────────────
+def self_ping():
+    """
+    Pings the bot's own /health endpoint every PING_INTERVAL seconds.
+    This prevents Koyeb free tier from sleeping the container.
+    On cold start, the first incoming webhook request wakes the server —
+    self-ping then keeps it alive for the session.
+    """
+    import time
+    health_url = f"{WEBHOOK_URL}/health"
+    # Wait for server to fully start before first ping
+    time.sleep(15)
+    while True:
+        try:
+            r = requests.get(health_url, timeout=10)
+            print(f"Self-ping: {r.status_code}")
+        except Exception as e:
+            print(f"Self-ping failed: {e}")
+        time.sleep(PING_INTERVAL)
+
+
+# ─────────────────────────────────────────────
 # Start Server
 # ─────────────────────────────────────────────
 def run_server():
@@ -505,4 +531,7 @@ def run_server():
 
 if __name__ == "__main__":
     setup_webhook()
+    # Start self-ping in background to keep free tier alive
+    Thread(target=self_ping, daemon=True).start()
+    print(f"Self-ping started (every {PING_INTERVAL}s -> {WEBHOOK_URL}/health)")
     run_server()
