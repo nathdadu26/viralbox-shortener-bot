@@ -11,7 +11,6 @@ import re
 load_dotenv()
 
 BOT_TOKEN = os.getenv("SHORTENER_BOT_TOKEN")
-API_KEY = os.getenv("API_KEY")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 MONGODB_URI = os.getenv("MONGODB_URI")
@@ -19,14 +18,8 @@ DB_NAME = os.getenv("MONGO_DB_NAME", "viralbox_db")
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = set([int(id.strip()) for id in ADMIN_IDS_STR.split(",") if id.strip()])
-
-if not BOT_TOKEN or not MONGODB_URI or not API_KEY:
-    raise RuntimeError("BOT_TOKEN, MONGODB_URI and API_KEY must be set")
-
-if not ADMIN_IDS:
-    raise RuntimeError("ADMIN_IDS must be set")
+if not BOT_TOKEN or not MONGODB_URI:
+    raise RuntimeError("BOT_TOKEN and MONGODB_URI must be set")
 
 if not WEBHOOK_URL:
     raise RuntimeError("WEBHOOK_URL must be set")
@@ -35,6 +28,7 @@ if not WEBHOOK_URL:
 client = MongoClient(MONGODB_URI, maxPoolSize=50)
 db = client[DB_NAME]
 links_col = db["links"]
+user_apis_col = db["user_apis"]
 
 # Stats
 bot_start_time = datetime.utcnow()
@@ -46,12 +40,12 @@ last_activity = datetime.utcnow()
 class WebhookHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         global total_requests, last_activity
-        
+
         if self.path == '/health' or self.path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            
+
             uptime = (datetime.utcnow() - bot_start_time).total_seconds()
             response = {
                 "status": "healthy",
@@ -59,7 +53,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
                 "mode": "webhook",
                 "timestamp": datetime.utcnow().isoformat(),
                 "uptime_seconds": int(uptime),
-                "admins": len(ADMIN_IDS),
                 "total_requests": total_requests,
                 "last_activity": last_activity.isoformat()
             }
@@ -67,27 +60,27 @@ class WebhookHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def do_POST(self):
         global total_requests, last_activity
-        
+
         if self.path == f'/{BOT_TOKEN}':
             content_length = int(self.headers['Content-Length'])
             post_data = self.rfile.read(content_length)
-            
+
             try:
                 update = json.loads(post_data.decode('utf-8'))
-                
+
                 if "message" in update:
                     total_requests += 1
                     last_activity = datetime.utcnow()
                     Thread(target=process_message, args=(update["message"],)).start()
-                
+
                 self.send_response(200)
                 self.send_header('Content-type', 'application/json')
                 self.end_headers()
                 self.wfile.write(b'{"ok": true}')
-                
+
             except Exception as e:
                 print(f"Webhook error: {e}")
                 self.send_response(500)
@@ -95,7 +88,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def log_message(self, format, *args):
         if "error" in format.lower():
             print(format % args)
@@ -104,11 +97,11 @@ class WebhookHandler(BaseHTTPRequestHandler):
 # Setup Webhook
 def setup_webhook():
     webhook_url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
-    
+
     try:
         requests.post(f"{TELEGRAM_API}/deleteWebhook")
         print("🗑️  Deleted old webhook")
-        
+
         response = requests.post(
             f"{TELEGRAM_API}/setWebhook",
             json={
@@ -117,27 +110,47 @@ def setup_webhook():
                 "allowed_updates": ["message"]
             }
         )
-        
+
         if response.json().get("ok"):
             print(f"✅ Webhook set: {webhook_url}")
-            print(f"👥 Admins: {len(ADMIN_IDS)}")
             print(f"🌐 Webhook mode - Platform friendly!")
         else:
             print(f"❌ Webhook failed: {response.text}")
-            
+
     except Exception as e:
         print(f"❌ Webhook error: {e}")
 
 
-# Admin Check
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+# Get user API key from DB
+def get_user_api_key(user_id):
+    try:
+        doc = user_apis_col.find_one({"userId": user_id})
+        if doc:
+            return doc.get("apiKey")
+        return None
+    except Exception as e:
+        print(f"DB get API error: {e}")
+        return None
+
+
+# Save user API key to DB
+def save_user_api_key(user_id, api_key):
+    try:
+        user_apis_col.update_one(
+            {"userId": user_id},
+            {"$set": {"userId": user_id, "apiKey": api_key}},
+            upsert=True
+        )
+        return True
+    except Exception as e:
+        print(f"DB save API error: {e}")
+        return False
 
 
 # Helpers
-def shorten_url(longURL):
+def shorten_url(long_url, api_key):
     try:
-        api = f"https://viralbox.in/api?api={API_KEY}&url={requests.utils.requote_uri(longURL)}"
+        api = f"https://viralbox.in/api?api={api_key}&url={requests.utils.requote_uri(long_url)}"
         r = requests.get(api, timeout=15)
         j = r.json()
         if j.get("status") == "success":
@@ -206,46 +219,75 @@ def process_message(msg):
         username = msg["from"].get("username", "Unknown")
         first_name = msg["from"].get("first_name", "User")
 
-        # Only admins can use the bot - silently ignore others
-        if not is_admin(user_id):
-            print(f"⛔ Unauthorized: {username} ({user_id})")
-            return
+        text = msg.get("text", "")
 
         # /start command
-        if msg.get("text", "").startswith("/start"):
+        if text.startswith("/start"):
             send_message(
                 chat_id,
                 f"👋 *Welcome {first_name}!*\n\n"
                 f"🔗 Send any link to shorten.\n"
                 f"📷 Or media with URL in caption.\n\n"
+                f"⚙️ *Setup:* Use `/set_api YOUR_API_KEY` to set your Viralbox API key before using the bot.\n\n"
                 f"Your ID: `{user_id}`"
             )
             return
 
+        # /set_api command
+        if text.startswith("/set_api"):
+            parts = text.strip().split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                send_message(
+                    chat_id,
+                    "❌ *Usage:* `/set_api YOUR_API_KEY`\n\nExample:\n`/set_api 030cd48a49cc4002ec50aeb10f3dc03ca0e84ce5`"
+                )
+                return
+
+            api_key = parts[1].strip()
+            success = save_user_api_key(user_id, api_key)
+            if success:
+                send_message(
+                    chat_id,
+                    f"✅ *API Key saved successfully!*\n\nYou can now send links to shorten them."
+                )
+                print(f"✅ API key set by {username} ({user_id})")
+            else:
+                send_message(chat_id, "❌ Failed to save API key. Please try again.")
+            return
+
+        # Get user's API key
+        api_key = get_user_api_key(user_id)
+        if not api_key:
+            send_message(
+                chat_id,
+                "⚠️ *API Key not set!*\n\nPlease set your Viralbox API key first:\n`/set_api YOUR_API_KEY`"
+            )
+            return
+
         # Text URL processing
-        if msg.get("text"):
-            urls = extract_urls(msg["text"])
+        if text:
+            urls = extract_urls(text)
             if not urls:
                 return
 
             shortened_links = []
             for url in urls:
-                short = shorten_url(url)
+                short = shorten_url(url, api_key)
                 if short:
                     save_to_db(url, short)
                     shortened_links.append(short)
                     print(f"✅ {username} (text): {short}")
 
             if not shortened_links:
+                send_message(chat_id, "❌ Could not shorten the URL. Please check your API key or try again.")
                 return
 
-            # Build response with formatted links
             response_parts = []
             for short_link in shortened_links:
                 response_parts.append(f"✅ Video Link 👇\n{short_link}\n")
-            
+
             response_parts.append("Join Backup channel ✅\n➤  https://t.me/+s1UUnoka8CdhYWVl")
-            
+
             final_response = "\n".join(response_parts)
             send_message(chat_id, final_response)
             return
@@ -268,22 +310,22 @@ def process_message(msg):
 
             shortened_links = []
             for url in urls:
-                short = shorten_url(url)
+                short = shorten_url(url, api_key)
                 if short:
                     save_to_db(url, short)
                     shortened_links.append(short)
                     print(f"✅ {username} (media): {short}")
 
             if not shortened_links:
+                send_message(chat_id, "❌ Could not shorten the URL. Please check your API key or try again.")
                 return
 
-            # Build caption with formatted links
             caption_parts = []
             for short_link in shortened_links:
                 caption_parts.append(f"✅ Video Link 👇\n{short_link}\n")
-            
+
             caption_parts.append("Join Backup channel ✅\n➤  https://t.me/+s1UUnoka8CdhYWVl")
-            
+
             final_caption = "\n".join(caption_parts)
             resend_media(chat_id, media_type, file_id, final_caption)
             return
